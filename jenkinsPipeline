@@ -1,0 +1,194 @@
+#!/usr/bin/groovy
+import groovy.json.*
+import hudson.model.*
+@NonCPS
+
+//代码库信息
+String srcUrl = "${env.srcUrl}"
+String srcType = "${env.srcType}"
+String tagName = "${env.tagName}"
+String branchName = "${env.branchName}"
+String moduleName = "${env.moduleName}"
+String credentialsId = "${env.credentialsId}"
+//String credentialsId = "358150f9-2e91-48fe-8da9-2569aaa1a30b"
+String projectName = "${env.projectName}"
+String appName = "${env.appName}"
+String dockerTag = "${env.dockerTag}"
+
+//服务信息
+String serviceName = "${env.serviceName}"
+String workspace = "${env.workspace}/${serviceName}"
+String dockerHub = "${env.dockerHub}"
+String dockerImage = "${dockerHub}/${projectName}/${appName}:${dockerTag}"
+String podCount = "${env.podCount}"
+String port = "${env.port}"
+String tport = "${env.tport}"
+
+//Jenkins信息
+String nodeSlave = "${env.nodeSlave}"
+String skipDeploy = "${env.skipDeploy}"
+String skipSonar = "${env.skipSonar}"
+String buildType = "${env.buildType}"
+String buildShell = "${env.buildShell}"
+String activeENV = "${env.activeENV}"
+String midwareType = "${env.midwareType}"
+
+echo "${branchName}"
+//代码检出
+def GetCode(srcType,srcUrl,tagName,branchName,credentialsId) {
+    if(srcType == "SVN") {
+        if(tagName == "null") {
+            svnUrl = "${srcUrl}@HEAD"
+        }else{
+            svnUrl = "${srcUrl}/${tagName}@HEAD"
+        }
+        checkout([
+            $class: 'SubversionSCM', 
+            additionalCredentials: [], 
+            filterChangelog: false, 
+            ignoreDirPropChanges: false, 
+            locations: [[credentialsId: "${credentialsId}", 
+            depthOption: 'infinity', 
+            ignoreExternalsOption: true, 
+            remote: "${svnUrl}"]], 
+            workspaceUpdater: [$class: 'CheckoutUpdater']]
+        ) 
+    } else if(srcType == "Git") {
+        //delete 'origin/'
+        if (branchName.startsWith('origin/')){
+        branchName=branchName.minus("origin/")
+        } 
+        
+        if(tagName == "null"){
+            pathName = "*/${branchName}"
+        }else{
+            pathName = "refs/tags/${tagName}"
+        }
+        checkout([$class: 'GitSCM', branches: [[name: "${pathName}"]], 
+            doGenerateSubmoduleConfigurations: false, 
+            extensions: [], submoduleCfg: [], 
+            userRemoteConfigs: [[credentialsId: "${credentialsId}", 
+            url: "${srcUrl}"]]])
+    }
+}
+
+//build工作目录
+def BuildDir(workspace,srcType,tagName,moduleName) {
+    def srcDir = workspace
+    if(srcType == "Git") {
+        buildDir = "${workspace}"
+        if(moduleName == "null"){
+            srcDir = "${workspace}"
+        }else{
+            srcDir = "${workspace}/${moduleName}"
+        }
+    }else{
+        if(tagName == "null") {
+            def srcTmp = srcUrl.split("/")[-1]
+            srcDir = "${workspace}/${srcTmp}"
+        }else{
+            srcDir = "${workspace}/${tagName}"
+        }
+        buildDir = srcDir
+    }
+    return [buildDir,srcDir]
+}
+
+//代码扫描
+def SonarScan(skipSonar,serviceName){
+    try {
+        def scanHome = tool 'Scanner2.6'
+        
+
+        // sh " ${scanHome}/bin/sonar-scanner -Dsonar.projectName=${serviceName} -Dsonar.projectKey=${serviceName}  "
+        sh "/usr/local/apache-maven/bin/mvn -f pom.xml clean compile sonar:sonar -Dsonar.projectName=${serviceName} -Dsonar.projectKey=${serviceName} "
+
+    } catch (e){
+        error 'skipSonar [false|true] '
+    }
+}
+
+// Workspace
+def buildDir = BuildDir(workspace,srcType,tagName,moduleName)[0]  // 获取build工作目录
+def srcDir = BuildDir(workspace,srcType,tagName,moduleName)[1]  // 获取build工作目录
+
+
+// ------------------------------------------------------
+node("master") {
+    def WORKSPACE = pwd()
+    echo "WORKSPACE: $WORKSPACE"
+
+    ws("${workspace}") {
+        //getcode
+        stage('拉取代码') {
+            echo "1.Clone Stage"
+            GetCode(srcType,srcUrl,tagName,branchName,credentialsId)
+        }
+    }
+        
+    ws("${workspace}"){
+        //build
+        stage("打包") {
+            sh "mvn package"
+            if("${midwareType}" == 'Springboot'){
+                if(moduleName == "null"){
+                    sh " cd ${srcDir} && mv target/*.jar app.jar"
+                }else{
+                    sh " cd ${srcDir} && mv target/*.jar ../app.jar"
+                }
+               
+            }else if ("${midwareType}" == 'Tomcat'){
+                if(moduleName == "null"){
+                    sh " cd /var/lib/jenkins/workspace/buildmaf  && mv target/*.war maf.war"
+                }else{
+                    sh " cd /var/lib/jenkins/workspace/buildmaf  && mv target/*.war ../maf.war"
+                }
+                
+            }
+    
+        }
+    
+        //sonar
+        if (skipSonar == 'false'){
+            stage("代码扫描"){
+                SonarScan(skipSonar,serviceName)
+            }
+        } else { println('跳过扫描')}
+
+        stage("构建镜像"){
+            if("${midwareType}" == 'Springboot'){
+                sh "curl --request GET --header 'PRIVATE-TOKEN: i-RhUbyugsty7jiKmsns' http://192.168.108.128:8090/baily/dockerfile/raw/master/tomcat.dockerfile?inline=false -o Dockerfile --progress"
+            }else if ("${midwareType}" == 'Tomcat'){
+                sh "curl --request GET --header 'PRIVATE-TOKEN: i-RhUbyugsty7jiKmsns' http://192.168.108.128:8090/baily/dockerfile/raw/master/tomcat.dockerfile?inline=false -o Dockerfile --progress"
+            }
+            sh " sudo docker build -t ${dockerImage} ."
+        }
+        
+        stage('推送镜像到镜像仓库') {
+            echo "4.Push Docker Image Stage"
+            //sh "docker login -u admin -pHarbor12345 https://registry.yk.com"
+            sh "sudo docker login -u admin -pHarbor12345 ${dockerHub}"
+            sh "sudo docker push ${dockerImage} "
+            //push完毕 删除镜像 回收空间
+            sh "sudo docker rmi ${dockerImage} "
+            
+        }
+        
+    
+        if ("${skipDeploy}" == 'false'){
+            stage('获取部署权限') {
+                echo "5. Change YAML File Stage"
+                GetCode(srcType,'http://gitlab.yk.com/devops/scripts.git',tagName,'master',credentialsId)
+            }
+
+            stage('执行部署') {
+              echo "6. Deploy Stage"
+              if ("${dockerHub}" == 'registry.yk.com'){
+                  sh " python test.openshift.py ${projectName} ${appName} ${dockerImage} ${podCount} ${port} ${tport}"
+              } else{
+                  sh " python prd.openshift.py ${projectName} ${appName} ${dockerImage} ${podCount} ${port} ${tport}"
+              }
+            }
+        }
+    }
+}
